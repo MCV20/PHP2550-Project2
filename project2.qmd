@@ -1,0 +1,724 @@
+---
+title: "Project2"
+author: "Monica Colon-Vargas"
+format: pdf
+editor: visual
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,
+                      message = FALSE,
+                      warning = FALSE, 
+                      fig.align="center")
+```
+
+```{r}
+#Set working directoty
+setwd("C:/Users/monic/OneDrive/Desktop/PHP2050/Project 2/")
+
+#Libraries
+library(readr)
+library(naniar)
+library(gtsummary)
+library(tableone)
+library(dplyr)
+library(ggplot2)
+library(gtable)
+library(kableExtra)
+library(mice)
+library(corrplot)
+library(ggpubr)
+library(lme4)
+library(MASS)
+library(pROC)
+library(glmnet)
+
+#Import Data
+df <- read.csv("project2.csv")
+
+
+#Exclude duplicates ID
+df <- df %>% filter(record_id != 2000824)
+
+
+
+#Change classes
+df <- df %>% 
+  mutate_if(is.character,as.factor)
+df <- df %>% 
+  mutate(center = factor(center),
+         mat_race = factor(mat_race),
+         mat_ethn = factor(mat_ethn),
+         del_method = factor(del_method),
+         ventilation_support_level.36 = factor(ventilation_support_level.36),
+         ventilation_support_level_modified.44 = factor(ventilation_support_level_modified.44),
+         med_ph.36 = factor(med_ph.36),
+         med_ph.44 = factor(med_ph.44),
+         Trach = factor(Trach)
+  )
+df <- df %>%
+  mutate_if(is.integer, as.numeric)
+df <- df %>% 
+  mutate(Trach = case_when(Trach == "0" ~ "No",
+                           Trach == "1" ~ "Yes")) %>%
+  mutate(Trach = as.factor(Trach))
+
+#which(df$center==21)
+df$center[806] <- 20
+
+df <- df %>% dplyr::select(!mat_race) #droppin race because of coding error
+df <- df %>% 
+  mutate(com_prenat_ster = case_when(prenat_ster == "No" ~ "No", TRUE ~ as.character(com_prenat_ster))) 
+df <- df %>% mutate(com_prenat_ster = as.factor(com_prenat_ster))
+df <- df %>% droplevels()
+```
+
+# Introduction
+
+# Data and Methodology
+
+```{r}
+#Summary Statistics
+tab_death <- df %>% dplyr::select(!record_id) %>%
+  tbl_summary(digits = list(everything() ~ c(2)),
+                   statistic = list(all_continuous() ~ "{mean} ({sd})"),
+                   by = Death) %>%
+  add_overall() %>% 
+  add_n() %>%
+  modify_header(label ~ "**Death**") %>%
+  modify_spanning_header(c("stat_1", "stat_2") ~ "**Treatment Received**") %>%
+  bold_labels()
+tab_trach <- df %>% dplyr::select(!record_id) %>%
+  tbl_summary(digits = list(everything() ~ c(2)),
+              statistic = list(all_continuous() ~ "{mean} ({sd})"),
+              by = Trach) %>%
+  add_overall() %>% 
+  add_n() %>%
+  modify_header(label ~ "**Death**") %>%
+  modify_spanning_header(c("stat_1", "stat_2") ~ "**Treatment Received**") %>%
+  bold_labels()
+
+merged_table <- tbl_merge(
+  tbls = list(tab_death, tab_trach),
+  tab_spanner = c("**Death**", "**Tracheostomy**")) %>%
+  as_kable_extra(booktabs = TRUE, caption = "Summary Statistics Grouped by Response Outcome") %>% 
+  kableExtra::kable_styling(latex_options = "scale_down")
+
+merged_table
+
+latex_code <- kable(merged_table, format = "latex", booktabs = TRUE, caption = "Summary Statistics Grouped by Response Outcome") %>%
+  kable_styling(latex_options = "scale_down") %>%
+  as.character()
+
+# Print or save the LaTeX code
+#cat(latex_code)
+#writeLines(merged_table)
+```
+
+### Outcome Variable
+
+```{r}
+#Composite Outcome
+df <- df %>% 
+  mutate(new_trach = case_when( Trach == "Yes" ~ "Yes",
+                        (Trach == "No" & Death == "Yes") ~ "Yes",
+                        (Trach == "No" & Death == "No") ~ "No")
+) 
+df$new_trach <- as.factor(df$new_trach)
+
+
+```
+
+```{r}
+#Creating three data frames for the three models
+df_birthmodel <- df[,c(1:14,30)]
+df_36wkmodel <- df[,c(1:20,27,30)]
+df_44wkmodel <- df %>% dplyr::select(!Trach & !Death)
+
+#Impute
+#Birthmodel
+df_birthmodel_out <- mice(df_birthmodel[,-1], 5, pri=F, seed = 1)
+df_imp_birthmodel <- vector("list",5)    
+for (i in 1:5){df_imp_birthmodel[[i]] <- mice::complete(df_birthmodel_out,i)}
+
+
+#36-wk model
+df_36wk_out <- mice(df_36wkmodel[,-1], 5, pri=F, seed = 1)
+df_imp_36wk <- vector("list",5)    
+for (i in 1:5){df_imp_36wk[[i]] <- mice::complete(df_36wk_out,i)}
+#select correct population
+for (i in 1:5) {
+  df_imp_36wk[[i]] <- df_imp_36wk[[i]] %>% filter(hosp_dc_ga > 36) %>% dplyr::select(!hosp_dc_ga)
+}
+
+#44-wk model
+df_44wk_out <- mice(df_44wkmodel[,-1], 5, pri=F, seed = 1)
+df_imp_44wk <- vector("list",5)    
+for (i in 1:5){df_imp_44wk[[i]] <- mice::complete(df_44wk_out,i)}
+#select correct population
+for (i in 1:5) {
+  df_imp_44wk[[i]] <- df_imp_44wk[[i]] %>% filter(hosp_dc_ga > 44) %>% dplyr::select(!hosp_dc_ga)
+}
+
+```
+
+### Missing Data
+
+```{r fig.width=7,fig.height=4.5}
+#pct_complete_case(df)
+
+
+#Creating Missing Values Table
+missing_table <- df %>% dplyr::select(!record_id) %>%
+  summarize(across(everything(), ~ sum(is.na(.x)))) %>%
+  t() %>%
+  as.data.frame() %>%
+  mutate(n=V1) %>%
+  dplyr::select(n) %>%
+  arrange(desc(n)) %>% 
+  mutate("%" = round(n/dim(df)[1],4)*100) %>%
+  filter(n>0)
+
+
+#kable(missing_table, caption = 'Missing Data per Variables', booktabs = TRUE) %>%
+#  kable_styling(full_width=T, font_size = 8 ,latex_options = c('hold_position', 'scale_down'))
+
+missing_table$Variable <- rownames(missing_table)
+dd <- missing_table %>% dplyr::select(Variable, n, '%') #taking what we are going to separate
+dd2 <- cbind(dd[1:13, ],dd[14:26,])#separating
+kable(dd2, 
+      caption = "Missing Data per Variables",booktabs=T,row.names = F,
+      align = "lrr") %>% 
+  kable_styling( font_size = 8,latex_options = c('scale_down'))
+
+
+#Visualization for Missing Data
+mis_vars <- missing_table %>% filter(n > 0) %>% rownames()
+
+#vis_miss(df %>% select(all_of(mis_vars)))+theme(axis.text.x=element_text(size=rel(.9), angle = 90))
+#vis_miss(df)+theme(axis.text.x=element_text(size=rel(.9), angle = 90))
+
+missing_table_death_no <- df %>% filter(Death != "No") %>%
+  summarize(across(everything(), ~ sum(is.na(.x)))) %>%
+  t() %>%
+  as.data.frame() %>%
+  mutate(n=V1) %>%
+  dplyr::select(n) %>%
+  arrange(desc(n)) %>% 
+  mutate("%" = round(n/dim(df %>% filter(Death != "No"))[1],4)*100)
+missing_table_death_yes <- df %>% filter(Death != "Yes") %>%
+  summarize(across(everything(), ~ sum(is.na(.x)))) %>%
+  t() %>%
+  as.data.frame() %>%
+  mutate(n=V1) %>%
+  dplyr::select(n) %>%
+  arrange(desc(n)) %>% 
+  mutate("%" = round(n/dim(df %>% filter(Death != "Yes"))[1],4)*100)
+
+
+
+#vis_miss(df)
+p1 <- vis_miss(df %>% filter(hosp_dc_ga < 44))+theme(axis.text.x=element_text(size=rel(.8), angle = 90))+ggtitle("Hospital Dicharge before 44 weeks")
+p2 <- vis_miss(df %>% filter(hosp_dc_ga > 44))+theme(axis.text.x=element_text(size=rel(.8), angle = 90))+ggtitle("Hospital Discharge after 44 weeks")
+ggarrange(p1,p2,ncol = 2)
+
+```
+
+```{r}
+##########Divide each imputed dataset into testing and training
+#BIRTHMODEL
+training_sets_birthmodel <- list()
+testing_sets_birthmodel <- list()
+
+set.seed(1)
+
+for (i in 1:5) {
+  n <- nrow(df_imp_birthmodel[[i]])
+  num_test <- ceiling(n * .25)
+  
+  test_indices <- sample(1:n, num_test)
+  
+  training <- df_imp_birthmodel[[i]][-test_indices, ]
+  testing <- df_imp_birthmodel[[i]][test_indices, ]
+  
+  training_sets_birthmodel[[i]] <- training
+  testing_sets_birthmodel[[i]] <- testing
+}
+#36-weekmodel
+training_sets_36wk <- list()
+testing_sets_36wk <- list()
+
+set.seed(1)
+
+for (i in 1:5) {
+  n <- nrow(df_imp_36wk[[i]])
+  num_test <- ceiling(n * .25)
+  
+  test_indices <- sample(1:n, num_test)
+  
+  training <- df_imp_36wk[[i]][-test_indices, ]
+  testing <- df_imp_36wk[[i]][test_indices, ]
+  
+  training_sets_36wk[[i]] <- training
+  testing_sets_36wk[[i]] <- testing
+}
+
+#44-weekmodel
+
+training_sets_44wk <- list()
+testing_sets_44wk <- list()
+
+set.seed(1)
+
+for (i in 1:5) {
+  n <- nrow(df_imp_44wk[[i]])
+  num_test <- ceiling(n * .25)
+  
+  test_indices <- sample(1:n, num_test)
+  
+  training <- df_imp_44wk[[i]][-test_indices, ]
+  testing <- df_imp_44wk[[i]][test_indices, ]
+  
+  training_sets_44wk[[i]] <- training
+  testing_sets_44wk[[i]] <- testing
+}
+
+```
+
+## Methods
+
+```{r}
+#Variable Selection for Mixed Model
+birth_model_var <- vector("list",5)
+
+for (i in 1:5) {
+xx <- training_sets_birthmodel[[i]][,-1] #not consider center(nested)
+model <- glm(new_trach ~., data = xx, family = binomial) %>%
+  stepAIC(trace = FALSE)
+ss <- summary(model)
+ss$coefficients
+birth_model_var[[i]] <- ss$coefficients
+}
+
+ 
+#Selected Variables for mixed model
+#sapply(birth_model_var, function(df) rownames(df)[-1]) %>% table()
+vars <- c(NA)
+for (i in 1:5) {
+  vars <- c(vars,unlist(rownames(birth_model_var[[i]])))
+}
+vars <- table(vars[-1])
+vars <- vars[vars>=3]
+vars <- names(vars)
+
+coef_birthmodel_mm <- matrix(NA,nrow = length(vars), ncol = 5)
+rownames(coef_birthmodel_mm) <- vars
+coef_center__birthmodel_mm <-  matrix(NA,nrow = 9, ncol = 5)
+rownames(coef_center__birthmodel_mm) <- c("center1","center2","center3","center4","center5","center7","center12","center16","center20")
+for (i in 1:5) {
+  mod <- glmer(new_trach ~ any_surf + blength + ga + mat_ethn + prenat_ster + sga +(1 | center),
+              data = training_sets_birthmodel[[i]] ,
+              family = binomial,
+              control=glmerControl(optimizer="bobyqa",
+                                   optCtrl=list(maxfun=2e5))) 
+  k <- mod %>% summary() %>% coef()
+  coef_birthmodel_mm[,i] <- k[,1]
+  k <- ranef(mod)$center
+  coef_center__birthmodel_mm[,i] <- k$`(Intercept)`
+  
+}
+
+coef_birthmodel_mm <- rowMeans(coef_birthmodel_mm)
+coef_center__birthmodel_mm <- rowMeans(coef_center__birthmodel_mm)
+
+
+##Predict
+auc_birthmodel_mm <- rep(NA,5)
+brier_birthmodel_mm <- rep(NA,5)
+sensitivity_birthmodel_mm <- rep(NA,5)
+specificity_birthmodel_mm <- rep(NA,5)
+threshold_birthmodel_mm <- rep(NA,5)
+
+for (i in 1:5) {
+x_new <- testing_sets_birthmodel[[i]]
+x_new <- x_new %>% dplyr::select(any_surf, blength,ga,mat_ethn,prenat_ster,sga, new_trach,center)
+x_new <- cbind(1,x_new)
+x_new <- model.matrix(new_trach ~ any_surf+blength+ga+mat_ethn+prenat_ster+sga + center, x_new, 
+                      contrasts.arg = list(center = contrasts( testing_sets_birthmodel[[i]]$center, 
+                                                              contrasts = FALSE)))
+
+pred <- x_new %*% c(coef_birthmodel_mm,coef_center__birthmodel_mm)
+pred <- exp(pred)/(exp(pred)+1)
+
+levels(testing_sets_birthmodel[[i]]$new_trach) = c(0,1)
+
+roc1 <- roc(predictor = pred, response = testing_sets_birthmodel[[i]]$new_trach, levels = c(0,1), direction = "<")
+#plot(roc1, print.thres=TRUE)
+
+k <- coords(roc=roc1, x = "best")
+
+#store metrics
+auc_birthmodel_mm[i] <- auc(roc1)
+brier_birthmodel_mm[i] <- mean((pred - (as.numeric(testing_sets_birthmodel[[i]]$new_trach)-1))^2)
+sensitivity_birthmodel_mm[i] <- k$sensitivity
+specificity_birthmodel_mm[i] <- k$specificity
+threshold_birthmodel_mm[i] <- k$threshold
+}
+
+auc_birthmodel_mm_pooled <- mean(auc_birthmodel_mm)
+brier_birthmodel_mm_pooled <- mean(brier_birthmodel_mm)
+sensitivity_birthmodel_mm_pooled <- mean(sensitivity_birthmodel_mm)
+specificity_birthmodel_mm_pooled <- mean(specificity_birthmodel_mm)
+threshold_birthmodel_mm_pooled <- mean(threshold_birthmodel_mm)
+```
+
+```{r}
+#LASSO
+lasso <- function(df) { 
+  #' Runs 10-fold CV for lasso and returns corresponding coefficients 
+  #' @param df, data set
+  #' @return coef, coefficients for minimum cv error
+  
+  # Matrix form for ordered variables  
+  x.ord <- model.matrix(new_trach~., data = df)[,-1] 
+  y.ord <- df$new_trach
+  
+  k <- 10 
+  set.seed(1)
+  folds <- sample(1:k, nrow(df), replace=TRUE)
+  
+  # Lasso model
+  lasso_mod_cv <- cv.glmnet(x.ord, y.ord, nfolds = 10, foldid = folds, 
+                         alpha = 1, family = "binomial") 
+  lasso_mod <- glmnet(x.ord, y.ord, nfolds = 10, foldid = folds, 
+                         alpha = 1, family = "binomial",
+                         lambda = lasso_mod_cv$lambda.min) 
+  # Get coefficients 
+  coef <- coef(lasso_mod) 
+  return(coef) 
+} 
+
+# Find average lasso coefficients over imputed datasets
+lasso_coef1 <- lasso(training_sets_birthmodel[[1]]) 
+lasso_coef2 <- lasso(training_sets_birthmodel[[2]]) 
+lasso_coef3 <- lasso(training_sets_birthmodel[[3]]) 
+lasso_coef4 <- lasso(training_sets_birthmodel[[4]]) 
+lasso_coef5 <- lasso(training_sets_birthmodel[[5]]) 
+lasso_coef <- cbind(lasso_coef1, lasso_coef2, lasso_coef3, 
+                    lasso_coef4, lasso_coef5) 
+avg_coefs_lasso_birthmodel <- apply(lasso_coef, 1, mean) 
+
+
+df_birthmodel_long_test <- bind_rows(testing_sets_birthmodel) 
+
+x_vars <- model.matrix(new_trach ~. , df_birthmodel_long_test) #get long data model matrix
+
+pred <- x_vars %*% avg_coefs_lasso_birthmodel #predict
+pred <- exp(pred)/(1+exp(pred))
+
+
+y <- df_birthmodel_long_test$new_trach
+levels(y) = c(0,1)
+roc1 <- roc(predictor = pred, response = y, levels = c(0,1), direction = "<")
+#plot(roc1, print.thres=TRUE)
+k <- coords(roc=roc1, x = "best")
+  
+#store metrics
+auc_birthmodel_lasso <- auc(roc1)[1]
+brier_birthmodel_lasso <- mean((pred - (as.numeric(y)-1))^2)
+sensitivity_birthmodel_lasso <- k$sensitivity
+specificity_birthmodel_lasso <- k$specificity
+threshold_birthmodel_lasso <- k$threshold
+
+```
+
+```{r}
+#################36wk model
+#Variable Selection for Mixed Model
+wk36_var <- vector("list",5)
+
+for (i in 1:5) {
+xx <- training_sets_36wk[[i]][,-1] #not consider center(nested)
+model <- glm(new_trach ~., data = xx, family = binomial) %>%
+  stepAIC(trace = FALSE)
+ss <- summary(model)
+ss$coefficients
+wk36_var[[i]] <- ss$coefficients
+}
+
+ 
+#Selected Variables for mixed model
+#sapply(birth_model_var, function(df) rownames(df)[-1]) %>% table()
+vars <- c(NA)
+for (i in 1:5) {
+  vars <- c(vars,unlist(rownames(wk36_var[[i]])))
+}
+vars <- table(vars[-1])
+vars <- vars[vars>=3]
+vars <- names(vars)
+
+coef_36wk_mm <- matrix(NA,nrow = length(vars), ncol = 5)
+rownames(coef_36wk_mm) <- vars
+coef_center__36wk_mm <-  matrix(NA,nrow = 9, ncol = 5)
+rownames(coef_center__36wk_mm) <- c("center1","center2","center3","center4","center5","center7","center12","center16","center20")
+for (i in 1:5) {
+  mod <- glmer(new_trach ~ any_surf + inspired_oxygen.36 + mat_ethn + med_ph.36 + prenat_ster + 
+               ventilation_support_level.36 + weight_today.36 + (1 | center),
+              data = training_sets_36wk[[i]] ,
+              family = binomial,
+              control=glmerControl(optimizer="bobyqa",
+                                   optCtrl=list(maxfun=2e5))) 
+  k <- mod %>% summary() %>% coef()
+  coef_36wk_mm[,i] <- k[,1]
+  k <- ranef(mod)$center
+  coef_center__36wk_mm[,i] <- k$`(Intercept)`
+  }
+
+coef_36wk_mm <- rowMeans(coef_36wk_mm)
+coef_center__36wk_mm <- rowMeans(coef_center__36wk_mm)
+
+
+##Predict
+auc_36wk_mm <- rep(NA,5)
+brier_36wk_mm <- rep(NA,5)
+sensitivity_36wk_mm <- rep(NA,5)
+specificity_36wk_mm <- rep(NA,5)
+threshold_36wk_mm <- rep(NA,5)
+
+for (i in 1:5) {
+x_new <- testing_sets_36wk[[i]]
+x_new <- x_new %>% dplyr::select( new_trach, any_surf, inspired_oxygen.36, mat_ethn,  med_ph.36, prenat_ster , 
+               ventilation_support_level.36 , weight_today.36, center)
+#x_new <- cbind(1,x_new)
+x_new <- model.matrix(new_trach ~  any_surf + inspired_oxygen.36 + mat_ethn + med_ph.36 + prenat_ster + 
+               ventilation_support_level.36 + weight_today.36  + center, x_new,
+                      contrasts.arg = list(center = contrasts( testing_sets_36wk[[i]]$center, 
+                                                              contrasts = FALSE)))
+
+pred <- x_new %*% c(coef_36wk_mm,coef_center__36wk_mm)
+pred <- exp(pred)/(exp(pred)+1)
+
+levels(testing_sets_36wk[[i]]$new_trach) = c(0,1)
+
+roc1 <- roc(predictor = pred, response = testing_sets_36wk[[i]]$new_trach, levels = c(0,1), direction = "<")
+#plot(roc1, print.thres=TRUE)
+
+k <- coords(roc=roc1, x = "best")
+
+#store metrics
+auc_36wk_mm[i] <- auc(roc1)
+brier_36wk_mm[i] <- mean((pred - (as.numeric(testing_sets_36wk[[i]]$new_trach)-1))^2)
+sensitivity_36wk_mm[i] <- k$sensitivity
+specificity_36wk_mm[i] <- k$specificity
+threshold_36wk_mm[i] <- k$threshold
+}
+
+auc_36wk_mm_pooled <- mean(auc_36wk_mm)
+brier_36wk_mm_pooled <- mean(brier_36wk_mm)
+sensitivity_36wk_mm_pooled <- mean(sensitivity_36wk_mm)
+specificity_36wk_mm_pooled <- mean(specificity_36wk_mm)
+threshold_36wk_mm_pooled <- mean(threshold_36wk_mm)
+
+#Recal that we choose vars repeated 3 or more because if we include all selected, the model was not capturing true pvalues for borth birthmodel and 36wk model
+```
+
+```{r}
+# Find average lasso coefficients over imputed datasets
+lasso_coef1 <- lasso(training_sets_36wk[[1]]) 
+lasso_coef2 <- lasso(training_sets_36wk[[2]]) 
+lasso_coef3 <- lasso(training_sets_36wk[[3]]) 
+lasso_coef4 <- lasso(training_sets_36wk[[4]]) 
+lasso_coef5 <- lasso(training_sets_36wk[[5]]) 
+lasso_coef <- cbind(lasso_coef1, lasso_coef2, lasso_coef3, 
+                    lasso_coef4, lasso_coef5) 
+avg_coefs_lasso_36wk <- apply(lasso_coef, 1, mean) 
+
+
+df_36wk_long_test <- bind_rows(testing_sets_36wk) 
+
+x_vars <- model.matrix(new_trach ~. , df_36wk_long_test) #get long data model matrix
+
+pred <- x_vars %*% avg_coefs_lasso_36wk #predict
+pred <- exp(pred)/(1+exp(pred))
+
+
+y <- df_36wk_long_test$new_trach
+levels(y) = c(0,1)
+roc1 <- roc(predictor = pred, response = y, levels = c(0,1), direction = "<")
+#plot(roc1, print.thres=TRUE)
+k <- coords(roc=roc1, x = "best")
+  
+#store metrics
+auc_36wk_lasso <- auc(roc1)[1]
+brier_36wk_lasso <- mean((pred - (as.numeric(y)-1))^2)
+sensitivity_36wk_lasso <- k$sensitivity
+specificity_36wk_lasso <- k$specificity
+threshold_36wk_lasso <- k$threshold
+```
+
+```{r}
+#################44wk model
+#Variable Selection for Mixed Model
+wk44_var <- vector("list",5)
+
+for (i in 1:5) {
+xx <- training_sets_44wk[[i]][,-1] #not consider center(nested)
+model <- glm(new_trach ~., data = xx, family = binomial) %>%
+  stepAIC(trace = FALSE)
+ss <- summary(model)
+ss$coefficients
+wk44_var[[i]] <- ss$coefficients
+}
+
+ 
+#Selected Variables for mixed model
+#sapply(birth_model_var, function(df) rownames(df)[-1]) %>% table()
+vars <- c(NA)
+for (i in 1:5) {
+  vars <- c(vars,unlist(rownames(wk44_var[[i]])))
+}
+vars <- table(vars[-1])
+vars <- vars[vars>=3]
+vars <- names(vars)
+
+coef_44wk_mm <- matrix(NA,nrow = length(vars), ncol = 5)
+rownames(coef_44wk_mm) <- vars
+coef_center__44wk_mm <-  matrix(NA,nrow = 9, ncol = 5)
+rownames(coef_center__44wk_mm) <- c("center1","center2","center3","center4","center5","center7","center12","center16","center20")
+for (i in 1:5) {
+  mod <- glmer(new_trach ~ inspired_oxygen.36 + med_ph.44 +  peep_cm_h2o_modified.44+
+                 prenat_ster + ventilation_support_level.36 + ventilation_support_level_modified.44 + weight_today.44 +(1 | center),
+              data = training_sets_44wk[[i]] ,
+              family = binomial,
+              control=glmerControl(optimizer="bobyqa",
+                                   optCtrl=list(maxfun=2e5))) 
+  k <- mod %>% summary() %>% coef()
+  coef_44wk_mm[,i] <- k[,1]
+  k <- ranef(mod)$center
+  coef_center__44wk_mm[,i] <- k$`(Intercept)`
+  
+}
+
+coef_44wk_mm <- rowMeans(coef_44wk_mm)
+coef_center__44wk_mm <- rowMeans(coef_center__44wk_mm)
+
+
+##Predict
+auc_44wk_mm <- rep(NA,5)
+brier_44wk_mm <- rep(NA,5)
+sensitivity_44wk_mm <- rep(NA,5)
+specificity_44wk_mm <- rep(NA,5)
+threshold_44wk_mm <- rep(NA,5)
+
+for (i in 1:5) {
+x_new <- testing_sets_44wk[[i]]
+x_new <- x_new %>% dplyr::select(inspired_oxygen.36, med_ph.44,peep_cm_h2o_modified.44,
+                 prenat_ster, ventilation_support_level.36, ventilation_support_level_modified.44, weight_today.44, new_trach, center)
+x_new <- model.matrix(new_trach ~ inspired_oxygen.36 + med_ph.44 +  peep_cm_h2o_modified.44+
+                 prenat_ster + ventilation_support_level.36 + ventilation_support_level_modified.44 + weight_today.44 + center, x_new,
+                        contrasts.arg = list(center = contrasts( testing_sets_36wk[[i]]$center, 
+                                                              contrasts = FALSE)))
+
+pred <- x_new %*% c(coef_44wk_mm,coef_center__44wk_mm)
+pred <- exp(pred)/(exp(pred)+1)
+
+levels(testing_sets_44wk[[i]]$new_trach) = c(0,1)
+
+roc1 <- roc(predictor = pred, response = testing_sets_44wk[[i]]$new_trach, levels = c(0,1), direction = "<")
+#plot(roc1, print.thres=TRUE)
+
+k <- coords(roc=roc1, x = "best")
+
+#store metrics
+auc_44wk_mm[i] <- auc(roc1)
+brier_44wk_mm[i] <- mean((pred - (as.numeric(testing_sets_44wk[[i]]$new_trach)-1))^2)
+sensitivity_44wk_mm[i] <- k$sensitivity
+specificity_44wk_mm[i] <- k$specificity
+threshold_44wk_mm[i] <- k$threshold
+
+}
+
+auc_44wk_mm_pooled <- mean(auc_44wk_mm)
+brier_44wk_mm_pooled <- mean(brier_44wk_mm)
+sensitivity_44wk_mm_pooled <- mean(sensitivity_44wk_mm)
+specificity_44wk_mm_pooled <- mean(specificity_44wk_mm)
+threshold_44wk_mm_pooled <- mean(threshold_44wk_mm)
+
+```
+
+```{r}
+# Find average lasso coefficients over imputed datasets
+lasso_coef1 <- lasso(training_sets_44wk[[1]]) 
+lasso_coef2 <- lasso(training_sets_44wk[[2]]) 
+lasso_coef3 <- lasso(training_sets_44wk[[3]]) 
+lasso_coef4 <- lasso(training_sets_44wk[[4]]) 
+lasso_coef5 <- lasso(training_sets_44wk[[5]]) 
+lasso_coef <- cbind(lasso_coef1, lasso_coef2, lasso_coef3, 
+                    lasso_coef4, lasso_coef5) 
+avg_coefs_lasso_44wk <- apply(lasso_coef, 1, mean) 
+
+
+df_44wk_long_test <- bind_rows(testing_sets_44wk) 
+
+x_vars <- model.matrix(new_trach ~. , df_44wk_long_test) #get long data model matrix
+
+pred <- x_vars %*% avg_coefs_lasso_44wk #predict
+pred <- exp(pred)/(1+exp(pred))
+
+
+y <- df_44wk_long_test$new_trach
+levels(y) = c(0,1)
+roc1 <- roc(predictor = pred, response = y, levels = c(0,1), direction = "<")
+#plot(roc1, print.thres=TRUE)
+k <- coords(roc=roc1, x = "best")
+  
+#store metrics
+auc_44wk_lasso <- auc(roc1)[1]
+brier_44wk_lasso <- mean((pred - (as.numeric(y)-1))^2)
+sensitivity_44wk_lasso <- k$sensitivity
+specificity_44wk_lasso <- k$specificity
+threshold_44wk_lasso <- k$threshold
+```
+
+# Results
+
+```{r}
+res_metrics <- data.frame(Metrics = c("AUC", "BRIER", "Sensitivity", "Specificity", "Threshold")
+)
+res_birthmodel <- data.frame(Mixed_Model = c(auc_birthmodel_mm_pooled,brier_birthmodel_mm_pooled,sensitivity_birthmodel_mm_pooled,specificity_birthmodel_mm_pooled,threshold_birthmodel_mm_pooled),
+           LASSO = c(auc_birthmodel_lasso,brier_birthmodel_lasso,sensitivity_birthmodel_lasso,specificity_birthmodel_lasso,threshold_birthmodel_lasso))
+
+rownames(res_birthmodel) <- c("AUC", "BRIER", "Sensitivity", "Specificity", "Threshold")
+
+
+res_36wk <- data.frame(Mixed_Model = c(auc_36wk_mm_pooled,brier_36wk_mm_pooled,sensitivity_36wk_mm_pooled,specificity_36wk_mm_pooled,threshold_36wk_mm_pooled),
+           LASSO = c(auc_36wk_lasso,brier_36wk_lasso,sensitivity_36wk_lasso,specificity_36wk_lasso,threshold_36wk_lasso))
+
+rownames(res_36wk) <- c("AUC", "BRIER", "Sensitivity", "Specificity", "Threshold")
+
+
+res_44wk <- data.frame(Mixed_Model = c(auc_44wk_mm_pooled,brier_44wk_mm_pooled,sensitivity_44wk_mm_pooled,specificity_44wk_mm_pooled,threshold_44wk_mm_pooled),
+           LASSO = c(auc_36wk_lasso,brier_44wk_lasso,sensitivity_44wk_lasso,specificity_44wk_lasso,threshold_44wk_lasso))
+
+rownames(res_44wk) <- c("AUC", "BRIER", "Sensitivity", "Specificity", "Threshold")
+
+
+kable(list(res_metrics, res_birthmodel, res_36wk, res_44wk), booktabs = T, row.names = F, caption = "Model Results") %>%
+ add_header_above(c(" ", "Birth Model", "36-Week Model", "44-Week Model")) %>% 
+  kable_styling(latex_options = c('scale_down'))
+
+
+  
+
+
+
+```
+
+# Conclusion
+
+\newpage
+
+# Code Apendix
+
+```{r ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE, include=TRUE}
+```
